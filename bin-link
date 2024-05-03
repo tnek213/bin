@@ -1,0 +1,64 @@
+#!/bin/sh
+
+# shellcheck shell=sh
+
+CLONE_DIR=$(
+  cd "$(dirname "$0")" || exit 1
+  pwd
+)
+
+in_path() { command -v "$1" 1>/dev/null; }
+
+DST_DIR="$HOME/bin"
+mkdir -p "$DST_DIR"
+
+for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
+  SUFFIX=${PAIR%,*}
+  SHEBANG_LINE=${PAIR#*,}
+  SHEBANG_PATH=${PAIR#*\#\!}
+  SHEBANG_PATH=${SHEBANG_PATH% *}
+  if ! in_path "$SHEBANG_PATH"; then
+    echo "Warning: Skipping ALL '*.$SUFFIX' files as '$SHEBANG_PATH' isn't in \$PATH" 1>&2
+    continue
+  fi
+
+  for SRC_PATH in "$CLONE_DIR/"*."$SUFFIX"; do
+    [ ! -f "$SRC_PATH" ] && echo "No *.$SUFFIX files" >&2 && continue
+
+    NOSUFFIX_NAME=$(basename "$SRC_PATH")
+    NOSUFFIX_NAME=${NOSUFFIX_NAME%%."$SUFFIX"}
+    SCRIPT="$(dirname "$SRC_PATH")/.$(basename "$SRC_PATH")"
+
+    if ! [ -x "$SRC_PATH" ]; then
+      echo "Warning: Skipping non executable '$SRC_PATH'" 1>&2
+      continue
+    fi
+
+    if [ "$(head -n 1 "$SRC_PATH")" != "$SHEBANG_LINE" ]; then
+      echo "Warning: Skipping '$SRC_PATH' as it has a malformed or missing shebang" 1>&2
+      continue
+    fi
+
+    DST_PATH="$DST_DIR/$NOSUFFIX_NAME"
+
+    if [ -e "$DST_PATH" ]; then
+      SRC_ID=$(stat -c '%d:%i' "$SRC_PATH")
+      DST_ID=$(stat -c '%d:%i' "$DST_PATH")
+      if [ "$SRC_ID" != "$DST_ID" ]; then
+        echo "Warning: Skipping link as both source '$SRC_PATH' and destination '$DST_PATH' exists but are different files!" 1>&2
+      fi
+      continue
+    fi
+
+    if [ -z "$MSG_SHOWN" ]; then
+      echo "Linking files from $CLONE_DIR to $DST_DIR..." 1>&2
+      MSG_SHOWN='true'
+    fi
+
+    if [ -e "$SCRIPT" ]; then
+      "$SCRIPT" && ln -v "$SRC_PATH" "$DST_PATH"
+    else
+      ln -v "$SRC_PATH" "$DST_PATH"
+    fi
+  done
+done
