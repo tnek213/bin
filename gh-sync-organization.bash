@@ -68,13 +68,19 @@ while read -r REPO _; do
       DISCARD=false
       cd "$DST"
       if timeout 30s git ls-remote --tags &>/dev/null; then
-        git fetch
+        if [[ -z $(timeout 10s git ls-remote --heads origin) ]]; then
+            echo "⚠️  Skipping repository $(basename "$REPO") - Remote repository is empty or unreachable."
+            continue
+        fi
+
+        git fetch --all --prune
         DIVERGED=$(git log --oneline --left-right "HEAD...origin/$(git branch --show-current)" || true)
         if [ -n "$DIVERGED" ]; then
           stderr "Local and remote branches have diverged"
           DISCARD=true
         else
-          git pull
+          git fetch --all --prune
+          git pull --all
         fi
       else
         DISCARD=true
@@ -90,6 +96,7 @@ while read -r REPO _; do
         gh repo clone "$REPO" "$DST"
         cd "$DST"
         gh_set_default "$REPO"
+        git fetch --all --prune
       fi
     )
   else
@@ -97,6 +104,7 @@ while read -r REPO _; do
       stderr "Cloning $REPO to $DST"
       gh repo clone "$REPO" "$DST"
       cd "$DST"
+      git fetch --all --prune
 
       if ! git remote -v | grep -q 'upstream'; then
         stderr "Skipping setting default as repo isn't a fork"
