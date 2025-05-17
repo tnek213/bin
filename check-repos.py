@@ -15,6 +15,7 @@ MATCHES = [
     re.compile(r"l2-.*-i4-.*"),
     re.compile(r"i-.*-i3-.*"),
     re.compile(r"d-.*-d4-.*"),
+    re.compile(r"l\d+-.*-d4-.*"),
 ]
 
 state_file = Path("~/.local/share/check-repos/state.json").expanduser()
