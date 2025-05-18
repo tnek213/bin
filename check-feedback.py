@@ -17,18 +17,20 @@ MENTOR = "kc8se"  # your GitHub login
 
 
 def run(cmd: list[str]) -> str:
-    """Return stdout from *cmd* or raise CalledProcessError."""
     return subprocess.check_output(cmd, text=True)
 
 
-def iso_to_ddmm_hhmm(iso_ts: str) -> str:
-    """2025-05-17T10:46:44Z → 17/05 10:46 (UTC)."""
-    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+def iso_to_ddmm_hhmm(ts: str) -> str:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     return dt.strftime("%d/%m %H:%M")
 
 
+def iso_to_yyyymmdd(ts: str) -> str:  # ← 8-digit date
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.strftime("%Y%m%d")
+
+
 def gh_api(path: str, *, paginate: bool = False) -> str:
-    """Convenience wrapper around `gh api`."""
     cmd = ["gh", "api", path]
     if paginate:
         cmd.append("--paginate")
@@ -46,7 +48,6 @@ def main() -> None:
     glob_pat, org = sys.argv[1], sys.argv[2]
     repo_pat = re.compile("^" + re.escape(glob_pat).replace(r"\*", ".*") + "$", re.I)
 
-    # 0️⃣  organisation repo list
     repos = json.loads(
         gh_api(f"/orgs/{org}/repos?per_page=1000&sort=full_name&direction=asc")
     )
@@ -56,6 +57,7 @@ def main() -> None:
         "Last Commit Author",
         "Last Commit Date",
         "Review Status",
+        "Review Date",
         "Message",
     ]
     rows: list[list[str]] = [header]
@@ -68,7 +70,7 @@ def main() -> None:
         default_branch = repo.get("default_branch") or "main"
         sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
 
-        # 1️⃣  latest commit on default branch
+        # 1️⃣  last commit
         author = commit_date = "N/A"
         try:
             commit = json.loads(gh_api(f"/repos/{org}/{name}/commits/{default_branch}"))
@@ -80,22 +82,23 @@ def main() -> None:
             sys.stderr.write(f"⚠️  Warning: could not fetch commit for {name}\n")
 
         review_status = "Unreviewed"
+        review_date = ""
         mentor_last_seen = "1970-01-01T00:00:00Z"
         msg_status = ""
 
-        # 2️⃣  find the feedback PR (base == feedback)
+        # 2️⃣  feedback PR
         try:
-            feedback_prs = json.loads(
+            pr_list = json.loads(
                 gh_api(f"/repos/{org}/{name}/pulls?state=all&base=feedback&per_page=1")
             )
         except subprocess.CalledProcessError:
             sys.stderr.write(f"⚠️  Warning: cannot list PRs for {name}\n")
-            feedback_prs = []
+            pr_list = []
 
-        if feedback_prs:
-            pr_num = feedback_prs[0]["number"]
+        if pr_list:
+            pr_num = pr_list[0]["number"]
 
-            # 2a️⃣  reviews
+            # reviews
             try:
                 reviews = json.loads(
                     gh_api(
@@ -115,6 +118,7 @@ def main() -> None:
             if my_reviews:
                 last_rv = max(my_reviews, key=lambda rv: rv["submitted_at"])
                 mentor_last_seen = last_rv["submitted_at"]
+                review_date = iso_to_yyyymmdd(mentor_last_seen)
                 review_status = (
                     "Approved"
                     if last_rv["state"] == "APPROVED"
@@ -123,7 +127,7 @@ def main() -> None:
                     else "Unreviewed"
                 )
 
-            # 2b️⃣  comments (all authors)
+            # comments
             try:
                 comments = json.loads(
                     gh_api(
@@ -137,7 +141,6 @@ def main() -> None:
                 )
                 comments = []
 
-            # update mentor_last_seen with any later mentor comments
             for c in comments:
                 if (
                     c["user"]["login"].lower() == MENTOR
@@ -145,14 +148,12 @@ def main() -> None:
                 ):
                     mentor_last_seen = c["created_at"]
 
-            # fetch reactions on student comments newer than mentor_last_seen
             for c in comments:
                 if (
                     c["user"]["login"].lower() == MENTOR
                     or c["created_at"] <= mentor_last_seen
                 ):
-                    continue  # skip mentor’s own comments and old comments
-
+                    continue
                 try:
                     reactions = json.loads(
                         gh_api(
@@ -162,16 +163,14 @@ def main() -> None:
                     )
                 except subprocess.CalledProcessError:
                     reactions = []
-
                 for rx in reactions:
                     if (
                         rx["user"]["login"].lower() == MENTOR
                         and rx["created_at"] > mentor_last_seen
                     ):
                         mentor_last_seen = rx["created_at"]
-                        break  # no need to inspect more reactions for this comment
+                        break
 
-            # 2c️⃣  any student comment after mentor_last_seen?
             has_unread = any(
                 c["user"]["login"].lower() != MENTOR
                 and c["created_at"] > mentor_last_seen
@@ -180,7 +179,7 @@ def main() -> None:
             if has_unread:
                 msg_status = "Message"
 
-        rows.append([name, author, commit_date, review_status, msg_status])
+        rows.append([name, author, commit_date, review_status, review_date, msg_status])
 
     # 3️⃣  pretty-print
     col_w = [max(len(row[i]) for row in rows) for i in range(len(header))]
