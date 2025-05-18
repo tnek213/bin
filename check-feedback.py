@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-check-feedback — Classroom-repo dashboard (GraphQL, threaded fetch)
-
-• Repos whose row in cache has no "Message" and identical repo.updatedAt are
-  reused instantly (0 network).
-• All others are fetched in parallel GraphQL calls (one per repo).
+check-feedback  —  Classroom-repo dashboard (GraphQL edition)
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import pathlib
 import re
@@ -23,13 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 MENTOR = "kc8se"
 AUTHOR_IGNORE_PATTERNS = [
     re.compile(r"^kc8se$", re.I),
-    re.compile(r"^github[-\\s]?classroom(\\[bot\\])?$", re.I),
-    re.compile(r"^dependabot(\\[bot\\])?$", re.I),
+    re.compile(r"^github[-\s]?classroom(\[bot\])?$", re.I),
+    re.compile(r"^dependabot(\[bot\])?$", re.I),
 ]
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
 PER_PAGE = 100
 MESSAGE_IDX = 6
-MAX_THREADS = 12  # adjust for your bandwidth / rate-limit comfort
 
 
 # ───────── helpers ─────────
@@ -38,9 +32,10 @@ def run(cmd: List[str], *, stdin: str | None = None) -> str:
 
 
 def gh_graphql(query: str, vars: Dict[str, str]) -> Dict[str, Any]:
-    args = ["gh", "api", "graphql", "-F", "query=@-"]
+    args = ["gh", "api", "graphql"]
     for k, v in vars.items():
         args += ["-f", f"{k}={v}"]
+    args += ["-F", "query=@-"]
     return json.loads(run(args, stdin=query))["data"]
 
 
@@ -76,27 +71,31 @@ def save_cache(org: str, data: Dict[str, Any]) -> None:
     cache_path(org).write_text(json.dumps(data))
 
 
-# ───────── GraphQL query (one repo) ─────────
+# ───────── GraphQL query ─────────
 GQL_REPO = textwrap.dedent("""
 query($owner:String!,$name:String!){
   repository(owner:$owner,name:$name){
     name updatedAt createdAt
-    defaultBranchRef{target{... on Commit{
-      history(first:20){
-        nodes{
-          committedDate
-          author{ user{login} name }
-          statusCheckRollup{ state }
-        }}}}
+    defaultBranchRef{
+      target{ ... on Commit{
+        history(first:20){
+          nodes{
+            committedDate
+            author{ user{login} name }
+            statusCheckRollup{ state }
+          }
+        }
+      }}
+    }
     pullRequests(first:1,baseRefName:"feedback",
       orderBy:{field:UPDATED_AT,direction:DESC}){
       nodes{
         number updatedAt
-        reviews(last:100){nodes{state submittedAt author{login}}}
+        reviews(last:100){ nodes{ state submittedAt author{login} } }
         comments(first:100){
           nodes{
             createdAt author{login}
-            reactions(last:100){nodes{createdAt user{login}}}
+            reactions(last:100){ nodes{ createdAt user{login} } }
           }
         }
       }
@@ -106,8 +105,8 @@ query($owner:String!,$name:String!){
 """).strip()
 
 
-# ───────── build one row (same as previous, unchanged) ─────────
-def build_row(org: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]:
+# ───────── build one row ─────────
+def build_row(owner: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]:
     r = repo_data["repository"]
     name, repo_upd = r["name"], r["updatedAt"]
 
@@ -118,21 +117,18 @@ def build_row(org: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]
         .get("nodes", [])
     )
     latest_iso = r["createdAt"]
-    student = ""
-    commit_date = iso_to_ddmm_hhmm(r["createdAt"])
-    health = ""
+    student, commit_date, health = "", iso_to_ddmm_hhmm(r["createdAt"]), ""
     if commits:
         latest_iso = commits[0]["committedDate"]
-        roll = commits[0]["statusCheckRollup"]
-        if roll:
-            st = roll["state"]
-            health = (
-                "Passed"
-                if st == "SUCCESS"
-                else "Failed"
-                if st in ("FAILURE", "ERROR")
-                else ""
-            )
+        # ───── FIX: null-safe statusCheckRollup ─────
+        rollup = commits[0]["statusCheckRollup"]
+        if rollup:  # may be None
+            st = rollup["state"]
+            if st == "SUCCESS":
+                health = "Passed"
+            elif st in ("FAILURE", "ERROR"):
+                health = "Failed"
+        # ───────────────────────────────────────────
         for c in commits:
             author = (
                 c["author"]["user"]["login"]
@@ -145,21 +141,19 @@ def build_row(org: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]
                 break
 
     pr_nodes = r["pullRequests"]["nodes"]
-    pr_upd = ""
+    pr_upd = pr_nodes[0]["updatedAt"] if pr_nodes else ""
     review_status = "" if student == "" else "Unreviewed"
-    review_date = ""
-    mentor_last = "1970-01-01T00:00:00Z"
-    msg = ""
+    review_date, mentor_last, msg = "", "1970-01-01T00:00:00Z", ""
+
     if pr_nodes:
         pr = pr_nodes[0]
-        pr_upd = pr["updatedAt"]
-        my = [
+        my_revs = [
             rv
             for rv in pr["reviews"]["nodes"]
             if rv["author"]["login"] and rv["author"]["login"].lower() == MENTOR
         ]
-        if my:
-            last = max(my, key=lambda x: x["submittedAt"])
+        if my_revs:
+            last = max(my_revs, key=lambda x: x["submittedAt"])
             mentor_last = last["submittedAt"]
             review_date = iso_to_yyyymmdd(mentor_last)
             if student:
@@ -167,6 +161,7 @@ def build_row(org: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]
                     review_status = "Approved"
                 elif last["state"] == "CHANGES_REQUESTED":
                     review_status = "Rereview" if latest_iso > mentor_last else "CR"
+
         comments = pr["comments"]["nodes"]
         for c in comments:
             if c["author"]["login"].lower() == MENTOR and c["createdAt"] > mentor_last:
@@ -215,47 +210,46 @@ def main() -> None:
         ]
     ]
 
-    # collect repos needing fetch
-    to_fetch: List[str] = []
-    repo_page_num = 1
+    page = 1
     while True:
-        url = f"/orgs/{org}/repos?per_page={PER_PAGE}&page={repo_page_num}&sort=updated&direction=desc&type=all"
-        page = gh_rest(url)
-        if not page:
+        url = f"/orgs/{org}/repos?per_page={PER_PAGE}&page={page}&sort=updated&direction=desc&type=all"
+        repo_page = gh_rest(url)
+        if not repo_page:
             break
-        for rp in page:
+
+        may_stop = True
+        for rp in repo_page:
             name = rp["name"]
             if not pat.match(name):
                 continue
-            repo_upd = rp["updated_at"]
+
+            data = gh_graphql(GQL_REPO, {"owner": org, "name": name})
+            row, repo_upd, pr_upd = build_row(org, data)
+
             cached = cache.get(name)
             if (
                 cached
                 and cached.get("repo_updated_at") == repo_upd
+                and cached.get("pr_updated_at") == pr_upd
                 and cached["row"][MESSAGE_IDX] == ""
             ):
                 rows.append(cached["row"])
                 new_cache[name] = cached
                 sys.stderr.write(f"💾  Cached  {name}\n")
             else:
-                to_fetch.append(name)
-        repo_page_num += 1
+                rows.append(row)
+                if row[MESSAGE_IDX] == "":
+                    new_cache[name] = {
+                        "repo_updated_at": repo_upd,
+                        "pr_updated_at": pr_upd,
+                        "row": row,
+                    }
+                may_stop = False
 
-    # parallel fetch the ones we missed
-    def fetch_repo(repo_name: str) -> Tuple[str, List[str], str, str]:
-        data = gh_graphql(GQL_REPO, {"owner": org, "name": repo_name})
-        row, repo_upd, pr_upd = build_row(org, data)
-        return repo_name, row, repo_upd, pr_upd
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
-        for repo_name, row, repo_upd, pr_upd in ex.map(fetch_repo, to_fetch):
-            rows.append(row)
-            if row[MESSAGE_IDX] == "":
-                new_cache[repo_name] = {
-                    "repo_updated_at": repo_upd,
-                    "pr_updated_at": pr_upd,
-                    "row": row,
-                }
+        if may_stop:
+            sys.stderr.write("⏹  No changes after this page — stopping pagination\n")
+            break
+        page += 1
 
     save_cache(org, new_cache)
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
