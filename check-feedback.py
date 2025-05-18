@@ -57,9 +57,7 @@ def load_cache(org: str) -> Dict[str, Any]:
     try:
         with cache_path(org).open("r") as fh:
             return json.load(fh)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
@@ -81,9 +79,20 @@ def main() -> None:
 
     cache: Dict[str, Any] = load_cache(org)
 
-    # 0️⃣  fetch organisation repos (includes updated_at)
+    # 0️⃣  organisation repo list (GraphQL, auto-paginated)
     repos = json.loads(
-        gh_api(f"/orgs/{org}/repos?per_page=1000&sort=full_name&direction=asc")
+        run(
+            [
+                "gh",
+                "repo",
+                "list",
+                org,
+                "--limit",
+                "4000",  # high enough for a classroom cohort
+                "--json",
+                "name,defaultBranchRef,updatedAt",
+            ]
+        )
     )
 
     header = [
@@ -95,23 +104,22 @@ def main() -> None:
         "Message",
     ]
     rows: List[List[str]] = [header]
-    new_cache: Dict[str, Any] = {}  # will replace the old one
+    new_cache: Dict[str, Any] = {}
 
     for repo in repos:
         name = repo["name"]
         if not repo_pat.match(name):
             continue
 
-        updated_at = repo["updated_at"]  # cache key
+        updated_at = repo["updatedAt"]
         cached = cache.get(name, {})
         if cached.get("updated_at") == updated_at:
-            # unchanged → reuse cached row
             rows.append(cached["row"])
             new_cache[name] = cached
             sys.stderr.write(f"💾  Cached  {name}\n")
             continue
 
-        default_branch = repo.get("default_branch") or "main"
+        default_branch = (repo.get("defaultBranchRef") or {}).get("name") or "main"
         sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
 
         # 1️⃣  latest commit
@@ -226,13 +234,11 @@ def main() -> None:
         row = [name, author, commit_date, review_status, review_date, msg_status]
         rows.append(row)
 
-        # save fresh result to cache
         new_cache[name] = {
             "updated_at": updated_at,
             "row": row,
         }
 
-    # replace cache on disk
     save_cache(org, new_cache)
 
     # 3️⃣  pretty-print
