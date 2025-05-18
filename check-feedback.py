@@ -2,6 +2,12 @@
 """
 check-feedback  —  classroom-repo dashboard
 
+• caches per-repo data keyed by updated_at
+• rows that contain “Message” are *not* cached, ensuring they are re-evaluated
+  until the mentor reacts / replies
+• Student column = latest commit whose author does *not* match AUTHOR_IGNORE_PATTERNS
+• If all commits are ignored, Student = '' and date = repo creation date
+
 Usage:
     check-feedback '<glob-pattern>' <org>
 """
@@ -20,11 +26,11 @@ from typing import Any, Dict, List
 
 MENTOR = "kc8se"  # your GitHub login
 
-AUTHOR_IGNORE_PATTERNS = [  # case-insensitive regexes
+AUTHOR_IGNORE_PATTERNS = [
     re.compile(r"^kc8se$", re.I),
     re.compile(r"^github[-\s]?classroom(\[bot\])?$", re.I),
     re.compile(r"^dependabot(\[bot\])?$", re.I),
-    # add more patterns here …
+    # add more patterns here…
 ]
 
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
@@ -81,7 +87,7 @@ def save_cache(org: str, data: Dict[str, Any]) -> None:
 
 
 def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
-    """Compute and return the table row for *repo*."""
+    """Return the table row for *repo* (and print progress to stderr)."""
     name = repo["name"]
     default_branch = repo["default_branch"] or "main"
     sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
@@ -244,21 +250,21 @@ def main() -> None:
             updated_at = repo["updated_at"]
             cached = cache.get(name)
 
-            use_cached = (
+            # Use cache only if updated_at unchanged AND message column empty
+            if (
                 cached
                 and cached["updated_at"] == updated_at
-                # verify cached student is still acceptable
-                and not is_ignored(cached["row"][1])
-            )
-
-            if use_cached:
+                and cached["row"][5] == ""  # Message column
+            ):
                 rows.append(cached["row"])
                 new_cache[name] = cached
                 sys.stderr.write(f"💾  Cached  {name}\n")
             else:
                 row = process_repo(org, repo)
                 rows.append(row)
-                new_cache[name] = {"updated_at": updated_at, "row": row}
+                # Cache only if Message cell is blank
+                if row[5] == "":
+                    new_cache[name] = {"updated_at": updated_at, "row": row}
                 may_stop = False
 
         if may_stop:
