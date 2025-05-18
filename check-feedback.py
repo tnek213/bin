@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 check-feedback  —  Classroom-repo dashboard (GraphQL edition)
+
+Columns
+  Repo | Student | Last Commit Date | Health | Review Status | Review Date | Message
 """
 
 from __future__ import annotations
@@ -12,9 +15,9 @@ import subprocess
 import sys
 import textwrap
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-# ───────── configuration ─────────
+# ─────────────────── configuration ───────────────────
 MENTOR = "kc8se"
 AUTHOR_IGNORE_PATTERNS = [
     re.compile(r"^kc8se$", re.I),
@@ -23,10 +26,10 @@ AUTHOR_IGNORE_PATTERNS = [
 ]
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
 PER_PAGE = 100
-MESSAGE_IDX = 6
+MESSAGE_IDX = 6  # index of “Message” column
 
 
-# ───────── helpers ─────────
+# ───────────────────── helpers ───────────────────────
 def run(cmd: List[str], *, stdin: str | None = None) -> str:
     return subprocess.check_output(cmd, text=True, input=stdin)
 
@@ -51,8 +54,8 @@ def iso_to_yyyymmdd(ts: str) -> str:
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y%m%d")
 
 
-def is_ignored(a: str) -> bool:
-    return any(p.search(a) for p in AUTHOR_IGNORE_PATTERNS)
+def is_ignored(author: str) -> bool:
+    return any(p.search(author) for p in AUTHOR_IGNORE_PATTERNS)
 
 
 def cache_path(org: str) -> pathlib.Path:
@@ -71,7 +74,7 @@ def save_cache(org: str, data: Dict[str, Any]) -> None:
     cache_path(org).write_text(json.dumps(data))
 
 
-# ───────── GraphQL query ─────────
+# ───────────────────── GraphQL query ──────────────────
 GQL_REPO = textwrap.dedent("""
 query($owner:String!,$name:String!){
   repository(owner:$owner,name:$name){
@@ -91,7 +94,9 @@ query($owner:String!,$name:String!){
       orderBy:{field:UPDATED_AT,direction:DESC}){
       nodes{
         number updatedAt
-        reviews(last:100){ nodes{ state submittedAt author{login} } }
+        reviews(last:100){
+          nodes{ state submittedAt author{login} }
+        }
         comments(first:100){
           nodes{
             createdAt author{login}
@@ -105,11 +110,12 @@ query($owner:String!,$name:String!){
 """).strip()
 
 
-# ───────── build one row ─────────
-def build_row(owner: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]:
-    r = repo_data["repository"]
+# ───────────────────── build one row ───────────────────
+def build_row(org: str, data: Dict[str, Any]) -> Tuple[List[str], str, str]:
+    r = data["repository"]
     name, repo_upd = r["name"], r["updatedAt"]
 
+    # commits
     commits = (
         (r["defaultBranchRef"] or {})
         .get("target", {})
@@ -117,18 +123,20 @@ def build_row(owner: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, st
         .get("nodes", [])
     )
     latest_iso = r["createdAt"]
-    student, commit_date, health = "", iso_to_ddmm_hhmm(r["createdAt"]), ""
+    student, commit_date = "", iso_to_ddmm_hhmm(r["createdAt"])
+    health = ""
     if commits:
         latest_iso = commits[0]["committedDate"]
-        # ───── FIX: null-safe statusCheckRollup ─────
-        rollup = commits[0]["statusCheckRollup"]
-        if rollup:  # may be None
-            st = rollup["state"]
-            if st == "SUCCESS":
-                health = "Passed"
-            elif st in ("FAILURE", "ERROR"):
-                health = "Failed"
-        # ───────────────────────────────────────────
+        roll = commits[0]["statusCheckRollup"]
+        if roll:
+            st = roll["state"]
+            health = (
+                "Passed"
+                if st == "SUCCESS"
+                else "Failed"
+                if st in ("FAILURE", "ERROR")
+                else ""
+            )
         for c in commits:
             author = (
                 c["author"]["user"]["login"]
@@ -140,44 +148,62 @@ def build_row(owner: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, st
                 commit_date = iso_to_ddmm_hhmm(c["committedDate"])
                 break
 
+    # feedback PR
     pr_nodes = r["pullRequests"]["nodes"]
     pr_upd = pr_nodes[0]["updatedAt"] if pr_nodes else ""
     review_status = "" if student == "" else "Unreviewed"
-    review_date, mentor_last, msg = "", "1970-01-01T00:00:00Z", ""
+    review_date, mentor_last_seen, msg = "", "1970-01-01T00:00:00Z", ""
 
     if pr_nodes:
         pr = pr_nodes[0]
-        my_revs = [
+
+        # ── filter out COMMENTED/DISMISSED reviews ──
+        my_reviews = [
             rv
             for rv in pr["reviews"]["nodes"]
-            if rv["author"]["login"] and rv["author"]["login"].lower() == MENTOR
+            if (
+                rv["author"]["login"]
+                and rv["author"]["login"].lower() == MENTOR
+                and rv["state"] in ("APPROVED", "CHANGES_REQUESTED")
+            )
         ]
-        if my_revs:
-            last = max(my_revs, key=lambda x: x["submittedAt"])
-            mentor_last = last["submittedAt"]
-            review_date = iso_to_yyyymmdd(mentor_last)
+        if my_reviews:
+            last = max(my_reviews, key=lambda x: x["submittedAt"])
+            mentor_last_seen = last["submittedAt"]
+            review_date = iso_to_yyyymmdd(mentor_last_seen)
             if student:
                 if last["state"] == "APPROVED":
                     review_status = "Approved"
-                elif last["state"] == "CHANGES_REQUESTED":
-                    review_status = "Rereview" if latest_iso > mentor_last else "CR"
+                else:  # CHANGES_REQUESTED
+                    review_status = (
+                        "Rereview" if latest_iso > mentor_last_seen else "CR"
+                    )
+        else:
+            review_status = "" if student == "" else "Unreviewed"
 
+        # comments & reactions for Message
         comments = pr["comments"]["nodes"]
         for c in comments:
-            if c["author"]["login"].lower() == MENTOR and c["createdAt"] > mentor_last:
-                mentor_last = c["createdAt"]
+            if (
+                c["author"]["login"].lower() == MENTOR
+                and c["createdAt"] > mentor_last_seen
+            ):
+                mentor_last_seen = c["createdAt"]
         for c in comments:
-            if c["author"]["login"].lower() == MENTOR or c["createdAt"] <= mentor_last:
+            if (
+                c["author"]["login"].lower() == MENTOR
+                or c["createdAt"] <= mentor_last_seen
+            ):
                 continue
             for rx in c["reactions"]["nodes"]:
                 if (
                     rx["user"]["login"].lower() == MENTOR
-                    and rx["createdAt"] > mentor_last
+                    and rx["createdAt"] > mentor_last_seen
                 ):
-                    mentor_last = rx["createdAt"]
+                    mentor_last_seen = rx["createdAt"]
                     break
         if any(
-            c["author"]["login"].lower() != MENTOR and c["createdAt"] > mentor_last
+            c["author"]["login"].lower() != MENTOR and c["createdAt"] > mentor_last_seen
             for c in comments
         ):
             msg = "Message"
@@ -189,7 +215,7 @@ def build_row(owner: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, st
     )
 
 
-# ───────── main ─────────
+# ───────────────────── main ───────────────────
 def main() -> None:
     if len(sys.argv) != 3:
         sys.stderr.write(f"Usage: {sys.argv[0]} <pattern> <org>\n")
@@ -198,7 +224,7 @@ def main() -> None:
     pat = re.compile("^" + re.escape(pattern).replace(r"\*", ".*") + "$", re.I)
 
     cache, new_cache = load_cache(org), {}
-    rows = [
+    rows: List[List[str]] = [
         [
             "Repo",
             "Student",
@@ -252,9 +278,10 @@ def main() -> None:
         page += 1
 
     save_cache(org, new_cache)
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+
+    col_w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
-        print("".join(c.ljust(widths[i] + 2) for i, c in enumerate(r)).rstrip())
+        print("".join(c.ljust(col_w[i] + 2) for i, c in enumerate(r)).rstrip())
 
 
 if __name__ == "__main__":
