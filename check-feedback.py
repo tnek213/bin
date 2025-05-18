@@ -2,9 +2,8 @@
 """
 check-feedback  —  classroom-repo dashboard
 
-• caches per-repo data keyed by updated_at
-• rows that contain “Message” are *not* cached, ensuring they are re-evaluated
-  until the mentor reacts / replies
+• Health column (Passed / Failed / blank) from combined status of latest commit
+• rows that contain “Message” are *not* cached
 • Student column = latest commit whose author does *not* match AUTHOR_IGNORE_PATTERNS
 • If all commits are ignored, Student = '' and date = repo creation date
 
@@ -92,13 +91,17 @@ def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
     default_branch = repo["default_branch"] or "main"
     sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
 
-    # 1️⃣  Student commit
+    # 1️⃣  Student commit  &  Health
     student = ""
     commit_date = iso_to_ddmm_hhmm(repo["created_at"])  # fallback
+    health = ""
+    commit_sha = None
     try:
         commits = json.loads(
             gh_api(f"/repos/{org}/{name}/commits?sha={default_branch}&per_page=100")
         )
+        if commits:
+            commit_sha = commits[0]["sha"]  # newest commit (may be bot)
         for c in commits:
             login = (c.get("author") or {}).get("login")
             display = login or c["commit"]["author"]["name"]
@@ -108,6 +111,21 @@ def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
                 break
     except subprocess.CalledProcessError:
         sys.stderr.write(f"⚠️  Warning: could not fetch commits for {name}\n")
+
+    # Health check via combined status on latest commit
+    if commit_sha:
+        try:
+            status = json.loads(
+                gh_api(f"/repos/{org}/{name}/commits/{commit_sha}/status")
+            )
+            if status["statuses"]:  # at least one check
+                state = status["state"]
+                if state == "success":
+                    health = "Passed"
+                elif state in ("failure", "error"):
+                    health = "Failed"
+        except subprocess.CalledProcessError:
+            sys.stderr.write(f"⚠️  Warning: could not fetch health for {name}\n")
 
     review_status = "Unreviewed"
     review_date = ""
@@ -201,7 +219,7 @@ def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
         if has_unread:
             msg_status = "Message"
 
-    return [name, student, commit_date, review_status, review_date, msg_status]
+    return [name, student, commit_date, health, review_status, review_date, msg_status]
 
 
 # ─────────────────────────── main ────────────────────────────
@@ -222,11 +240,14 @@ def main() -> None:
         "Repo",
         "Student",
         "Last Commit Date",
+        "Health",
         "Review Status",
         "Review Date",
         "Message",
     ]
     rows: List[List[str]] = [header]
+
+    MESSAGE_IDX = 6  # column index for Message after adding Health
 
     page = 1
     while True:
@@ -250,20 +271,20 @@ def main() -> None:
             updated_at = repo["updated_at"]
             cached = cache.get(name)
 
-            # Use cache only if updated_at unchanged AND message column empty
-            if (
+            use_cached = (
                 cached
                 and cached["updated_at"] == updated_at
-                and cached["row"][5] == ""  # Message column
-            ):
+                and cached["row"][MESSAGE_IDX] == ""
+            )
+            if use_cached:
                 rows.append(cached["row"])
                 new_cache[name] = cached
                 sys.stderr.write(f"💾  Cached  {name}\n")
             else:
                 row = process_repo(org, repo)
                 rows.append(row)
-                # Cache only if Message cell is blank
-                if row[5] == "":
+                # cache only if Message is empty
+                if row[MESSAGE_IDX] == "":
                     new_cache[name] = {"updated_at": updated_at, "row": row}
                 may_stop = False
 
