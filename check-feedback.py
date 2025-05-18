@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 """
-check-feedback  —  classroom-repo status dashboard
-Usage:  check-feedback '<glob-pattern>' <org>
+check-feedback  —  classroom-repo status dashboard with caching
+
+Usage:
+    check-feedback '<glob-pattern>' <org>
 """
 
+from __future__ import annotations
+
 import json
+import os
+import pathlib
 import re
 import subprocess
 import sys
 from datetime import datetime
+from typing import Any, Dict, List
 
 MENTOR = "kc8se"  # your GitHub login
+CACHE_DIR = pathlib.Path("~/.cache").expanduser()
 
 
 # ────────────────────────── helpers ──────────────────────────
 
 
-def run(cmd: list[str]) -> str:
+def run(cmd: List[str]) -> str:
     return subprocess.check_output(cmd, text=True)
-
-
-def iso_to_ddmm_hhmm(ts: str) -> str:
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return dt.strftime("%d/%m %H:%M")
-
-
-def iso_to_yyyymmdd(ts: str) -> str:  # ← 8-digit date
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return dt.strftime("%Y%m%d")
 
 
 def gh_api(path: str, *, paginate: bool = False) -> str:
@@ -35,6 +33,39 @@ def gh_api(path: str, *, paginate: bool = False) -> str:
     if paginate:
         cmd.append("--paginate")
     return run(cmd)
+
+
+def iso_to_ddmm_hhmm(ts: str) -> str:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.strftime("%d/%m %H:%M")
+
+
+def iso_to_yyyymmdd(ts: str) -> str:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.strftime("%Y%m%d")
+
+
+# ────────────────────────── caching ──────────────────────────
+
+
+def cache_path(org: str) -> pathlib.Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"check-feedback-{org}.json"
+
+
+def load_cache(org: str) -> Dict[str, Any]:
+    try:
+        with cache_path(org).open("r") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_cache(org: str, data: Dict[str, Any]) -> None:
+    with cache_path(org).open("w") as fh:
+        json.dump(data, fh)
 
 
 # ─────────────────────────── main ────────────────────────────
@@ -48,6 +79,9 @@ def main() -> None:
     glob_pat, org = sys.argv[1], sys.argv[2]
     repo_pat = re.compile("^" + re.escape(glob_pat).replace(r"\*", ".*") + "$", re.I)
 
+    cache: Dict[str, Any] = load_cache(org)
+
+    # 0️⃣  fetch organisation repos (includes updated_at)
     repos = json.loads(
         gh_api(f"/orgs/{org}/repos?per_page=1000&sort=full_name&direction=asc")
     )
@@ -60,17 +94,27 @@ def main() -> None:
         "Review Date",
         "Message",
     ]
-    rows: list[list[str]] = [header]
+    rows: List[List[str]] = [header]
+    new_cache: Dict[str, Any] = {}  # will replace the old one
 
     for repo in repos:
         name = repo["name"]
         if not repo_pat.match(name):
             continue
 
+        updated_at = repo["updated_at"]  # cache key
+        cached = cache.get(name, {})
+        if cached.get("updated_at") == updated_at:
+            # unchanged → reuse cached row
+            rows.append(cached["row"])
+            new_cache[name] = cached
+            sys.stderr.write(f"💾  Cached  {name}\n")
+            continue
+
         default_branch = repo.get("default_branch") or "main"
         sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
 
-        # 1️⃣  last commit
+        # 1️⃣  latest commit
         author = commit_date = "N/A"
         try:
             commit = json.loads(gh_api(f"/repos/{org}/{name}/commits/{default_branch}"))
@@ -179,12 +223,22 @@ def main() -> None:
             if has_unread:
                 msg_status = "Message"
 
-        rows.append([name, author, commit_date, review_status, review_date, msg_status])
+        row = [name, author, commit_date, review_status, review_date, msg_status]
+        rows.append(row)
+
+        # save fresh result to cache
+        new_cache[name] = {
+            "updated_at": updated_at,
+            "row": row,
+        }
+
+    # replace cache on disk
+    save_cache(org, new_cache)
 
     # 3️⃣  pretty-print
-    col_w = [max(len(row[i]) for row in rows) for i in range(len(header))]
-    for row in rows:
-        print("".join(cell.ljust(col_w[i] + 2) for i, cell in enumerate(row)).rstrip())
+    col_w = [max(len(r[i]) for r in rows) for i in range(len(header))]
+    for r in rows:
+        print("".join(c.ljust(col_w[i] + 2) for i, c in enumerate(r)).rstrip())
 
 
 if __name__ == "__main__":
