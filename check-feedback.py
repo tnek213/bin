@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check-feedback  —  classroom-repo dashboard with smart pagination & caching
+check-feedback  —  classroom-repo dashboard
 
 Usage:
     check-feedback '<glob-pattern>' <org>
@@ -16,12 +16,22 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List
 
+# ───────────────────────── configuration ──────────────────────────
+
 MENTOR = "kc8se"  # your GitHub login
+
+AUTHOR_IGNORE_PATTERNS = [  # case-insensitive regexes
+    re.compile(r"^kc8se$", re.I),
+    re.compile(r"^github[-\s]?classroom(\[bot\])?$", re.I),
+    re.compile(r"^dependabot(\[bot\])?$", re.I),
+    # add more patterns here …
+]
+
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
-PER_PAGE = 100  # GitHub REST max page size
+PER_PAGE = 100  # REST max page size
 
 
-# ────────────────────────── helpers ──────────────────────────
+# ────────────────────────── helpers ───────────────────────────────
 
 
 def run(cmd: List[str]) -> str:
@@ -42,7 +52,11 @@ def iso_to_yyyymmdd(ts: str) -> str:
     return dt.strftime("%Y%m%d")
 
 
-# ────────────────────────── caching ──────────────────────────
+def is_ignored(author: str) -> bool:
+    return any(p.search(author) for p in AUTHOR_IGNORE_PATTERNS)
+
+
+# ────────────────────────── caching ───────────────────────────────
 
 
 def cache_path(org: str) -> pathlib.Path:
@@ -67,21 +81,27 @@ def save_cache(org: str, data: Dict[str, Any]) -> None:
 
 
 def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
-    """Return the table row for *repo* (and print progress to stderr)."""
+    """Compute and return the table row for *repo*."""
     name = repo["name"]
     default_branch = repo["default_branch"] or "main"
     sys.stderr.write(f"⏳ Processing {name} (branch={default_branch})\n")
 
-    # 1️⃣  latest commit
-    author = commit_date = "N/A"
+    # 1️⃣  Student commit
+    student = ""
+    commit_date = iso_to_ddmm_hhmm(repo["created_at"])  # fallback
     try:
-        commit = json.loads(gh_api(f"/repos/{org}/{name}/commits/{default_branch}"))
-        author = (commit.get("author") or {}).get("login") or commit["commit"][
-            "author"
-        ]["name"]
-        commit_date = iso_to_ddmm_hhmm(commit["commit"]["author"]["date"])
+        commits = json.loads(
+            gh_api(f"/repos/{org}/{name}/commits?sha={default_branch}&per_page=100")
+        )
+        for c in commits:
+            login = (c.get("author") or {}).get("login")
+            display = login or c["commit"]["author"]["name"]
+            if display and not is_ignored(display):
+                student = display
+                commit_date = iso_to_ddmm_hhmm(c["commit"]["author"]["date"])
+                break
     except subprocess.CalledProcessError:
-        sys.stderr.write(f"⚠️  Warning: could not fetch commit for {name}\n")
+        sys.stderr.write(f"⚠️  Warning: could not fetch commits for {name}\n")
 
     review_status = "Unreviewed"
     review_date = ""
@@ -175,7 +195,7 @@ def process_repo(org: str, repo: Dict[str, Any]) -> List[str]:
         if has_unread:
             msg_status = "Message"
 
-    return [name, author, commit_date, review_status, review_date, msg_status]
+    return [name, student, commit_date, review_status, review_date, msg_status]
 
 
 # ─────────────────────────── main ────────────────────────────
@@ -194,7 +214,7 @@ def main() -> None:
 
     header = [
         "Repo",
-        "Last Commit Author",
+        "Student",
         "Last Commit Date",
         "Review Status",
         "Review Date",
@@ -214,7 +234,6 @@ def main() -> None:
         if not repo_page:
             break
 
-        # Assume we might be able to stop after this page
         may_stop = True
 
         for repo in repo_page:
@@ -224,7 +243,15 @@ def main() -> None:
 
             updated_at = repo["updated_at"]
             cached = cache.get(name)
-            if cached and cached["updated_at"] == updated_at:
+
+            use_cached = (
+                cached
+                and cached["updated_at"] == updated_at
+                # verify cached student is still acceptable
+                and not is_ignored(cached["row"][1])
+            )
+
+            if use_cached:
                 rows.append(cached["row"])
                 new_cache[name] = cached
                 sys.stderr.write(f"💾  Cached  {name}\n")
@@ -232,7 +259,6 @@ def main() -> None:
                 row = process_repo(org, repo)
                 rows.append(row)
                 new_cache[name] = {"updated_at": updated_at, "row": row}
-                # We had a cache miss → need to keep paging
                 may_stop = False
 
         if may_stop:
@@ -243,7 +269,6 @@ def main() -> None:
 
     save_cache(org, new_cache)
 
-    # print table
     col_w = [max(len(r[i]) for r in rows) for i in range(len(header))]
     for r in rows:
         print("".join(c.ljust(col_w[i] + 2) for i, c in enumerate(r)).rstrip())
