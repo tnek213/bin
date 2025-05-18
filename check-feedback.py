@@ -46,12 +46,20 @@ def gh_rest(url: str) -> Dict[str, Any]:
     return json.loads(run(["gh", "api", url]))
 
 
+def local_time(ts: str) -> datetime:
+    dt_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+    dt_target = dt_utc.astimezone()
+
+    return dt_target
+
+
 def iso_to_ddmm_hhmm(ts: str) -> str:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%d/%m %H:%M")
+    return local_time(ts).strftime("%d/%m %H:%M")
 
 
 def iso_to_yyyymmdd(ts: str) -> str:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y%m%d")
+    return local_time(ts).strftime("%Y-%m-%d")
 
 
 def is_ignored(author: str) -> bool:
@@ -280,6 +288,7 @@ def main() -> None:
     save_cache(org, new_cache)
 
     col_w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    rows.sort(key=lambda x: x[0])
     for r in rows:
         print("".join(c.ljust(col_w[i] + 2) for i, c in enumerate(r)).rstrip())
 
