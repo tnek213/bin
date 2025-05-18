@@ -1,58 +1,51 @@
 #!/usr/bin/env python3
 """
-check-feedback  —  Classroom-repo dashboard with smart caching
+check-feedback — Classroom-repo dashboard (GraphQL, threaded fetch)
 
-┌ Columns ─────────────────────────────────────────────────────────┐
-│ Repo • Student • Last Commit Date • Health • Review Status      │
-│ Review Date • Message                                           │
-└──────────────────────────────────────────────────────────────────┘
-
-Review Status rules
-  • ""        → Student column blank (nothing to review)
-  • Approved  → most recent mentor review = APPROVED
-  • CR        → most recent mentor review = CHANGES_REQUESTED and no new commits
-  • Rereview  → most recent mentor review = CHANGES_REQUESTED *and* students
-                have pushed after that review.
-
-Caching
-  • Row cached only when Message == "".
-  • Reused next run if repo.updated_at and feedback-PR.updated_at unchanged.
-
-Usage
-    check-feedback '<glob-pattern>' <org>
+• Repos whose row in cache has no "Message" and identical repo.updatedAt are
+  reused instantly (0 network).
+• All others are fetched in parallel GraphQL calls (one per repo).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import pathlib
 import re
 import subprocess
 import sys
+import textwrap
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-# ────────── Configuration ──────────
-MENTOR = "kc8se"  # your GitHub login
-
+# ───────── configuration ─────────
+MENTOR = "kc8se"
 AUTHOR_IGNORE_PATTERNS = [
     re.compile(r"^kc8se$", re.I),
-    re.compile(r"^github[-\s]?classroom(\[bot\])?$", re.I),
-    re.compile(r"^dependabot(\[bot\])?$", re.I),
+    re.compile(r"^github[-\\s]?classroom(\\[bot\\])?$", re.I),
+    re.compile(r"^dependabot(\\[bot\\])?$", re.I),
 ]
-
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
 PER_PAGE = 100
-MESSAGE_IDX = 6  # column index of “Message”
+MESSAGE_IDX = 6
+MAX_THREADS = 12  # adjust for your bandwidth / rate-limit comfort
 
 
-# ────────── Helpers ──────────
-def run(cmd: List[str]) -> str:
-    return subprocess.check_output(cmd, text=True)
+# ───────── helpers ─────────
+def run(cmd: List[str], *, stdin: str | None = None) -> str:
+    return subprocess.check_output(cmd, text=True, input=stdin)
 
 
-def gh_api(path: str) -> str:
-    return run(["gh", "api", path])
+def gh_graphql(query: str, vars: Dict[str, str]) -> Dict[str, Any]:
+    args = ["gh", "api", "graphql", "-F", "query=@-"]
+    for k, v in vars.items():
+        args += ["-f", f"{k}={v}"]
+    return json.loads(run(args, stdin=query))["data"]
+
+
+def gh_rest(url: str) -> Dict[str, Any]:
+    return json.loads(run(["gh", "api", url]))
 
 
 def iso_to_ddmm_hhmm(ts: str) -> str:
@@ -63,8 +56,8 @@ def iso_to_yyyymmdd(ts: str) -> str:
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y%m%d")
 
 
-def is_ignored(author: str) -> bool:
-    return any(p.search(author) for p in AUTHOR_IGNORE_PATTERNS)
+def is_ignored(a: str) -> bool:
+    return any(p.search(a) for p in AUTHOR_IGNORE_PATTERNS)
 
 
 def cache_path(org: str) -> pathlib.Path:
@@ -74,162 +67,134 @@ def cache_path(org: str) -> pathlib.Path:
 
 def load_cache(org: str) -> Dict[str, Any]:
     try:
-        with cache_path(org).open() as fh:
-            return json.load(fh)
+        return json.loads(cache_path(org).read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
 def save_cache(org: str, data: Dict[str, Any]) -> None:
-    with cache_path(org).open("w") as fh:
-        json.dump(data, fh)
+    cache_path(org).write_text(json.dumps(data))
 
 
-# ───── feedback-PR meta (number + updated_at) ─────
-def feedback_pr_meta(org: str, repo: str) -> Tuple[Optional[int], str]:
-    try:
-        info = json.loads(
-            gh_api(f"/repos/{org}/{repo}/pulls?state=all&base=feedback&per_page=1")
-        )
-        if info:
-            pr = info[0]
-            return pr["number"], pr["updated_at"]
-    except subprocess.CalledProcessError:
-        pass
-    return None, ""
+# ───────── GraphQL query (one repo) ─────────
+GQL_REPO = textwrap.dedent("""
+query($owner:String!,$name:String!){
+  repository(owner:$owner,name:$name){
+    name updatedAt createdAt
+    defaultBranchRef{target{... on Commit{
+      history(first:20){
+        nodes{
+          committedDate
+          author{ user{login} name }
+          statusCheckRollup{ state }
+        }}}}
+    pullRequests(first:1,baseRefName:"feedback",
+      orderBy:{field:UPDATED_AT,direction:DESC}){
+      nodes{
+        number updatedAt
+        reviews(last:100){nodes{state submittedAt author{login}}}
+        comments(first:100){
+          nodes{
+            createdAt author{login}
+            reactions(last:100){nodes{createdAt user{login}}}
+          }
+        }
+      }
+    }
+  }
+}
+""").strip()
 
 
-# ───── Build one table row ─────
-def build_row(
-    org: str, repo_obj: Dict[str, Any], pr_num: Optional[int], pr_upd: str
-) -> List[str]:
-    name = repo_obj["name"]
-    branch = repo_obj["default_branch"] or "main"
-    sys.stderr.write(f"⏳ Processing {name} (branch={branch})\n")
+# ───────── build one row (same as previous, unchanged) ─────────
+def build_row(org: str, repo_data: Dict[str, Any]) -> Tuple[List[str], str, str]:
+    r = repo_data["repository"]
+    name, repo_upd = r["name"], r["updatedAt"]
 
-    # Student commit & Health
+    commits = (
+        (r["defaultBranchRef"] or {})
+        .get("target", {})
+        .get("history", {})
+        .get("nodes", [])
+    )
+    latest_iso = r["createdAt"]
     student = ""
-    commit_date = iso_to_ddmm_hhmm(repo_obj["created_at"])
-    latest_commit_date_iso = repo_obj["created_at"]
+    commit_date = iso_to_ddmm_hhmm(r["createdAt"])
     health = ""
-    commit_sha = None
-    try:
-        commits = json.loads(
-            gh_api(f"/repos/{org}/{name}/commits?sha={branch}&per_page=100")
-        )
-        if commits:
-            latest_commit_date_iso = commits[0]["commit"]["author"]["date"]
-            commit_sha = commits[0]["sha"]
+    if commits:
+        latest_iso = commits[0]["committedDate"]
+        roll = commits[0]["statusCheckRollup"]
+        if roll:
+            st = roll["state"]
+            health = (
+                "Passed"
+                if st == "SUCCESS"
+                else "Failed"
+                if st in ("FAILURE", "ERROR")
+                else ""
+            )
         for c in commits:
-            author = (c.get("author") or {}).get("login") or c["commit"]["author"][
-                "name"
-            ]
+            author = (
+                c["author"]["user"]["login"]
+                if c["author"]["user"]
+                else c["author"]["name"]
+            )
             if author and not is_ignored(author):
                 student = author
-                commit_date = iso_to_ddmm_hhmm(c["commit"]["author"]["date"])
+                commit_date = iso_to_ddmm_hhmm(c["committedDate"])
                 break
-    except subprocess.CalledProcessError:
-        sys.stderr.write(f"⚠️  commits fetch failed for {name}\n")
 
-    if commit_sha:
-        try:
-            st = json.loads(gh_api(f"/repos/{org}/{name}/commits/{commit_sha}/status"))
-            if st["statuses"]:
-                health = (
-                    "Passed"
-                    if st["state"] == "success"
-                    else "Failed"
-                    if st["state"] in ("failure", "error")
-                    else ""
-                )
-        except subprocess.CalledProcessError:
-            sys.stderr.write(f"⚠️  health fetch failed for {name}\n")
-
-    # Review / Message
-    review_status, review_date, mentor_last_seen, msg_status = (
-        "",
-        "",
-        "1970-01-01T00:00:00Z",
-        "",
-    )
-    if pr_num is not None:
-        try:
-            reviews = json.loads(
-                gh_api(
-                    f"/repos/{org}/{name}/pulls/{pr_num}/reviews?per_page=100&direction=desc"
-                )
-            )
-        except subprocess.CalledProcessError:
-            reviews = []
-        my_reviews = [
+    pr_nodes = r["pullRequests"]["nodes"]
+    pr_upd = ""
+    review_status = "" if student == "" else "Unreviewed"
+    review_date = ""
+    mentor_last = "1970-01-01T00:00:00Z"
+    msg = ""
+    if pr_nodes:
+        pr = pr_nodes[0]
+        pr_upd = pr["updatedAt"]
+        my = [
             rv
-            for rv in reviews
-            if rv.get("user", {}).get("login", "").lower() == MENTOR
+            for rv in pr["reviews"]["nodes"]
+            if rv["author"]["login"] and rv["author"]["login"].lower() == MENTOR
         ]
-        if my_reviews:
-            last = max(my_reviews, key=lambda x: x["submitted_at"])
-            last_state, mentor_last_seen = last["state"], last["submitted_at"]
-            review_date = iso_to_yyyymmdd(mentor_last_seen)
-            # determine status
-            if student == "":
-                review_status = ""  # nothing to review
-            elif last_state == "APPROVED":
-                review_status = "Approved"
-            elif last_state == "CHANGES_REQUESTED":
-                # compare timestamps
-                needs = latest_commit_date_iso > mentor_last_seen
-                review_status = "Rereview" if needs else "CR"
-            else:
-                review_status = "Unreviewed"
-        else:
-            review_status = "" if student == "" else "Unreviewed"
-
-        # comments + reactions for Message flag
-        try:
-            comments = json.loads(
-                gh_api(
-                    f"/repos/{org}/{name}/issues/{pr_num}/comments?per_page=100&direction=desc"
-                )
-            )
-        except subprocess.CalledProcessError:
-            comments = []
+        if my:
+            last = max(my, key=lambda x: x["submittedAt"])
+            mentor_last = last["submittedAt"]
+            review_date = iso_to_yyyymmdd(mentor_last)
+            if student:
+                if last["state"] == "APPROVED":
+                    review_status = "Approved"
+                elif last["state"] == "CHANGES_REQUESTED":
+                    review_status = "Rereview" if latest_iso > mentor_last else "CR"
+        comments = pr["comments"]["nodes"]
         for c in comments:
-            if (
-                c["user"]["login"].lower() == MENTOR
-                and c["created_at"] > mentor_last_seen
-            ):
-                mentor_last_seen = c["created_at"]
+            if c["author"]["login"].lower() == MENTOR and c["createdAt"] > mentor_last:
+                mentor_last = c["createdAt"]
         for c in comments:
-            if (
-                c["user"]["login"].lower() == MENTOR
-                or c["created_at"] <= mentor_last_seen
-            ):
+            if c["author"]["login"].lower() == MENTOR or c["createdAt"] <= mentor_last:
                 continue
-            try:
-                reacts = json.loads(
-                    gh_api(
-                        f"/repos/{org}/{name}/issues/comments/{c['id']}/reactions?per_page=100"
-                    )
-                )
-            except subprocess.CalledProcessError:
-                reacts = []
-            for rx in reacts:
+            for rx in c["reactions"]["nodes"]:
                 if (
                     rx["user"]["login"].lower() == MENTOR
-                    and rx["created_at"] > mentor_last_seen
+                    and rx["createdAt"] > mentor_last
                 ):
-                    mentor_last_seen = rx["created_at"]
+                    mentor_last = rx["createdAt"]
                     break
         if any(
-            c["user"]["login"].lower() != MENTOR and c["created_at"] > mentor_last_seen
+            c["author"]["login"].lower() != MENTOR and c["createdAt"] > mentor_last
             for c in comments
         ):
-            msg_status = "Message"
+            msg = "Message"
 
-    return [name, student, commit_date, health, review_status, review_date, msg_status]
+    return (
+        [name, student, commit_date, health, review_status, review_date, msg],
+        repo_upd,
+        pr_upd,
+    )
 
 
-# ────────── main ──────────
+# ───────── main ─────────
 def main() -> None:
     if len(sys.argv) != 3:
         sys.stderr.write(f"Usage: {sys.argv[0]} <pattern> <org>\n")
@@ -250,50 +215,47 @@ def main() -> None:
         ]
     ]
 
-    page = 1
+    # collect repos needing fetch
+    to_fetch: List[str] = []
+    repo_page_num = 1
     while True:
-        repos = json.loads(
-            gh_api(
-                f"/orgs/{org}/repos?per_page={PER_PAGE}&page={page}&sort=updated&direction=desc&type=all"
-            )
-        )
-        if not repos:
+        url = f"/orgs/{org}/repos?per_page={PER_PAGE}&page={repo_page_num}&sort=updated&direction=desc&type=all"
+        page = gh_rest(url)
+        if not page:
             break
-        may_stop = True
-        for repo in repos:
-            name = repo["name"]
+        for rp in page:
+            name = rp["name"]
             if not pat.match(name):
                 continue
-            repo_upd = repo["updated_at"]
-            pr_num, pr_upd = feedback_pr_meta(org, name)
-
+            repo_upd = rp["updated_at"]
             cached = cache.get(name)
-            use_cached = (
+            if (
                 cached
                 and cached.get("repo_updated_at") == repo_upd
-                and cached.get("pr_updated_at") == pr_upd
-                and isinstance(cached.get("row"), list)
-                and len(cached["row"]) > MESSAGE_IDX
                 and cached["row"][MESSAGE_IDX] == ""
-            )
-            if use_cached:
+            ):
                 rows.append(cached["row"])
                 new_cache[name] = cached
                 sys.stderr.write(f"💾  Cached  {name}\n")
             else:
-                row = build_row(org, repo, pr_num, pr_upd)
-                rows.append(row)
-                if row[MESSAGE_IDX] == "":
-                    new_cache[name] = {
-                        "repo_updated_at": repo_upd,
-                        "pr_updated_at": pr_upd,
-                        "row": row,
-                    }
-                may_stop = False
-        if may_stop:
-            sys.stderr.write("⏹  No changes after this page — stopping pagination\n")
-            break
-        page += 1
+                to_fetch.append(name)
+        repo_page_num += 1
+
+    # parallel fetch the ones we missed
+    def fetch_repo(repo_name: str) -> Tuple[str, List[str], str, str]:
+        data = gh_graphql(GQL_REPO, {"owner": org, "name": repo_name})
+        row, repo_upd, pr_upd = build_row(org, data)
+        return repo_name, row, repo_upd, pr_upd
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        for repo_name, row, repo_upd, pr_upd in ex.map(fetch_repo, to_fetch):
+            rows.append(row)
+            if row[MESSAGE_IDX] == "":
+                new_cache[repo_name] = {
+                    "repo_updated_at": repo_upd,
+                    "pr_updated_at": pr_upd,
+                    "row": row,
+                }
 
     save_cache(org, new_cache)
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
