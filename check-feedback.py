@@ -2,23 +2,21 @@
 """
 check-feedback  —  Classroom-repo dashboard with smart caching
 
-Columns
-  ▸ Repo
-  ▸ Student              (latest commit author not in AUTHOR_IGNORE_PATTERNS)
-  ▸ Last Commit Date     (DD/MM HH:MM UTC — or repo creation date if all commits ignored)
-  ▸ Health               (Passed / Failed / blank from combined status of latest commit)
-  ▸ Review Status        (Approved / CR / Unreviewed)
-  ▸ Review Date          (YYYYMMDD of most-recent mentor review)
-  ▸ Message              (“Message” when student activity after mentor_last_seen)
+┌ Columns ─────────────────────────────────────────────────────────┐
+│ Repo • Student • Last Commit Date • Health • Review Status      │
+│ Review Date • Message                                           │
+└──────────────────────────────────────────────────────────────────┘
 
-Caching strategy
-  • Row cached only if Message == "".
-  • Reused next run if BOTH
-        repo_updated_at  unchanged  AND
-        feedback-PR updated_at unchanged.
-  • New commits → repo timestamp bumps → cache invalidated.
-  • New reviews / student comments → PR timestamp bumps → cache invalidated.
-  • Mentor reaction clears Message flag → row wasn’t cached, so flag disappears.
+Review Status rules
+  • ""        → Student column blank (nothing to review)
+  • Approved  → most recent mentor review = APPROVED
+  • CR        → most recent mentor review = CHANGES_REQUESTED and no new commits
+  • Rereview  → most recent mentor review = CHANGES_REQUESTED *and* students
+                have pushed after that review.
+
+Caching
+  • Row cached only when Message == "".
+  • Reused next run if repo.updated_at and feedback-PR.updated_at unchanged.
 
 Usage
     check-feedback '<glob-pattern>' <org>
@@ -34,22 +32,21 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-# ─────────────────── Configuration ────────────────────
+# ────────── Configuration ──────────
 MENTOR = "kc8se"  # your GitHub login
 
 AUTHOR_IGNORE_PATTERNS = [
     re.compile(r"^kc8se$", re.I),
     re.compile(r"^github[-\s]?classroom(\[bot\])?$", re.I),
     re.compile(r"^dependabot(\[bot\])?$", re.I),
-    # add more patterns if needed
 ]
 
 CACHE_DIR = pathlib.Path("~/.cache").expanduser()
-PER_PAGE = 100  # GitHub REST max page size
-MESSAGE_IDX = 6  # column index of “Message” after Health column
+PER_PAGE = 100
+MESSAGE_IDX = 6  # column index of “Message”
 
 
-# ─────────────────── Helper functions ─────────────────
+# ────────── Helpers ──────────
 def run(cmd: List[str]) -> str:
     return subprocess.check_output(cmd, text=True)
 
@@ -102,9 +99,9 @@ def feedback_pr_meta(org: str, repo: str) -> Tuple[Optional[int], str]:
     return None, ""
 
 
-# ───── Build one table row (expensive) ─────
+# ───── Build one table row ─────
 def build_row(
-    org: str, repo_obj: Dict[str, Any], pr_num: Optional[int], pr_updated: str
+    org: str, repo_obj: Dict[str, Any], pr_num: Optional[int], pr_upd: str
 ) -> List[str]:
     name = repo_obj["name"]
     branch = repo_obj["default_branch"] or "main"
@@ -113,6 +110,7 @@ def build_row(
     # Student commit & Health
     student = ""
     commit_date = iso_to_ddmm_hhmm(repo_obj["created_at"])
+    latest_commit_date_iso = repo_obj["created_at"]
     health = ""
     commit_sha = None
     try:
@@ -120,6 +118,7 @@ def build_row(
             gh_api(f"/repos/{org}/{name}/commits?sha={branch}&per_page=100")
         )
         if commits:
+            latest_commit_date_iso = commits[0]["commit"]["author"]["date"]
             commit_sha = commits[0]["sha"]
         for c in commits:
             author = (c.get("author") or {}).get("login") or c["commit"]["author"][
@@ -130,7 +129,7 @@ def build_row(
                 commit_date = iso_to_ddmm_hhmm(c["commit"]["author"]["date"])
                 break
     except subprocess.CalledProcessError:
-        sys.stderr.write(f"⚠️  Warning: commits fetch failed for {name}\n")
+        sys.stderr.write(f"⚠️  commits fetch failed for {name}\n")
 
     if commit_sha:
         try:
@@ -144,11 +143,11 @@ def build_row(
                     else ""
                 )
         except subprocess.CalledProcessError:
-            sys.stderr.write(f"⚠️  Warning: health fetch failed for {name}\n")
+            sys.stderr.write(f"⚠️  health fetch failed for {name}\n")
 
     # Review / Message
     review_status, review_date, mentor_last_seen, msg_status = (
-        "Unreviewed",
+        "",
         "",
         "1970-01-01T00:00:00Z",
         "",
@@ -169,16 +168,23 @@ def build_row(
         ]
         if my_reviews:
             last = max(my_reviews, key=lambda x: x["submitted_at"])
-            mentor_last_seen = last["submitted_at"]
+            last_state, mentor_last_seen = last["state"], last["submitted_at"]
             review_date = iso_to_yyyymmdd(mentor_last_seen)
-            review_status = (
-                "Approved"
-                if last["state"] == "APPROVED"
-                else "CR"
-                if last["state"] == "CHANGES_REQUESTED"
-                else "Unreviewed"
-            )
-        # comments
+            # determine status
+            if student == "":
+                review_status = ""  # nothing to review
+            elif last_state == "APPROVED":
+                review_status = "Approved"
+            elif last_state == "CHANGES_REQUESTED":
+                # compare timestamps
+                needs = latest_commit_date_iso > mentor_last_seen
+                review_status = "Rereview" if needs else "CR"
+            else:
+                review_status = "Unreviewed"
+        else:
+            review_status = "" if student == "" else "Unreviewed"
+
+        # comments + reactions for Message flag
         try:
             comments = json.loads(
                 gh_api(
@@ -200,14 +206,14 @@ def build_row(
             ):
                 continue
             try:
-                reactions = json.loads(
+                reacts = json.loads(
                     gh_api(
                         f"/repos/{org}/{name}/issues/comments/{c['id']}/reactions?per_page=100"
                     )
                 )
             except subprocess.CalledProcessError:
-                reactions = []
-            for rx in reactions:
+                reacts = []
+            for rx in reacts:
                 if (
                     rx["user"]["login"].lower() == MENTOR
                     and rx["created_at"] > mentor_last_seen
@@ -223,7 +229,7 @@ def build_row(
     return [name, student, commit_date, health, review_status, review_date, msg_status]
 
 
-# ─────────────────────────── main ────────────────────────────
+# ────────── main ──────────
 def main() -> None:
     if len(sys.argv) != 3:
         sys.stderr.write(f"Usage: {sys.argv[0]} <pattern> <org>\n")
@@ -246,24 +252,25 @@ def main() -> None:
 
     page = 1
     while True:
-        page_repos = json.loads(
+        repos = json.loads(
             gh_api(
                 f"/orgs/{org}/repos?per_page={PER_PAGE}&page={page}&sort=updated&direction=desc&type=all"
             )
         )
-        if not page_repos:
+        if not repos:
             break
         may_stop = True
-        for repo in page_repos:
+        for repo in repos:
             name = repo["name"]
-            updated = repo["updated_at"]
             if not pat.match(name):
                 continue
+            repo_upd = repo["updated_at"]
             pr_num, pr_upd = feedback_pr_meta(org, name)
+
             cached = cache.get(name)
             use_cached = (
                 cached
-                and cached.get("repo_updated_at") == updated
+                and cached.get("repo_updated_at") == repo_upd
                 and cached.get("pr_updated_at") == pr_upd
                 and isinstance(cached.get("row"), list)
                 and len(cached["row"]) > MESSAGE_IDX
@@ -278,7 +285,7 @@ def main() -> None:
                 rows.append(row)
                 if row[MESSAGE_IDX] == "":
                     new_cache[name] = {
-                        "repo_updated_at": updated,
+                        "repo_updated_at": repo_upd,
                         "pr_updated_at": pr_upd,
                         "row": row,
                     }
@@ -289,7 +296,6 @@ def main() -> None:
         page += 1
 
     save_cache(org, new_cache)
-
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("".join(c.ljust(widths[i] + 2) for i, c in enumerate(r)).rstrip())
