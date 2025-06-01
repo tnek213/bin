@@ -2,10 +2,12 @@
 
 # Use the first argument as FPS, default to 3 if not provided
 FPS="${1:-3}"
+FPS=$((FPS < 1 ? 1 : FPS))   # Ensure FPS is at least 1
+FPS=$((FPS > 60 ? 60 : FPS)) # Cap FPS at 60
 
 # Prompt the user to click on the screen they want to record, showing the chosen FPS
-read -p "Enter a description for the recording (enter for blank): " DESCRIPTION
-echo "Click screen XXX to record at ${FPS} fps"
+read -r -p "Enter a description for the recording (enter for blank): " DESCRIPTION
+echo "Click screen XXX to record at $FPS fps"
 CLICK_INFO=$(xwininfo)
 
 # Extract the absolute X/Y coordinates of the click
@@ -61,7 +63,7 @@ META="${OUTPUT}.meta.txt"
 # delete any partial META file to avoid leftover data.
 trap 'rm -f "$META"' EXIT
 
-[ "${DESCRIPTION// /}" == "" ] && echo "$DESCRIPTION" >"$META"
+[ "${DESCRIPTION// /}" == "" ] && echo "Starting with a blank screen without windows." >"$META"
 
 # Background loop: capture window titles on the selected screen every second
 (
@@ -102,13 +104,48 @@ trap 'rm -f "$META"' EXIT
 ) &
 BG_PID=$!
 
-# Replace the short-lived trap with a final cleanup trap:
-#   - kill the background loop
-#   - dedupe the META file
-trap 'kill "$BG_PID" 2>/dev/null
-      if [[ -f "$META" ]]; then
-        sort -u "$META" -o "$META"
-      fi' EXIT
+# Define a cleanup function for the final EXIT trap
+cleanup() {
+  # Kill the background window‐title loop
+  kill "$BG_PID" 2>/dev/null
+
+  wait "$BG_PID" 2>/dev/null
+
+  # Deduplicate the metadata file if it exists
+  if [[ -f "$META" ]]; then
+    sort -u "$META" -o "$META"
+  fi
+
+  COMPRESSED="${OUTPUT%.mkv}_compressed.mkv"
+
+  # Start a background lossless re‐encode process to reduce file size, detached so it persists after logout
+  # shellcheck disable=SC2086
+  nohup nice bash -cx "
+    echo \"Initial video size: \$(du -hs \"$OUTPUT\")\" >> \"$META\"
+
+    ffmpeg -i \"$OUTPUT\" \
+      -c:v libx264 \
+      -preset veryslow \
+      -crf 0 \
+      -pix_fmt yuv444p \
+      -an \
+      \"$COMPRESSED\" >/dev/null 2>&1
+
+    mv -v \"$COMPRESSED\" \"$OUTPUT\" >> \"$META\"
+
+    echo \"Final video size: \$(du -hs '$OUTPUT')\" >> \"$META\"
+  " &>/dev/null &
+
+  # nohup ffmpeg -i "$OUTPUT"
+  #   -c:v libx264
+  #   -preset veryslow # spend more CPU time for better compression
+  # -crf 0             # lossless in YUV domain
+  # -pix_fmt yuv444p   # maintain full‐resolution chroma (no blur)
+  # -an                # disable audio
+  # "$COMPRESSED" >/dev/null 2>&1 &
+}
+
+trap 'cleanup' EXIT
 
 # Run ffmpeg with the detected geometry, using the specified FPS, no blur (YUV444p), and no audio
 ffmpeg \
