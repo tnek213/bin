@@ -1,6 +1,6 @@
 ## About the Repository
 
-The scripts in this repository are mostly of value to my need, I share them in case they're helpful to someone else in the spirit of openness.
+The scripts in this repository are mostly of value to me, I share them in case they're helpful to someone else in the spirit of openness.
 
 ## Contributing
 
