@@ -6,7 +6,7 @@ The scripts in this repository are mostly of value to my need, I share them in c
 
 As these scripts are custom made to fit my needs I'm not interested in broadening them to fit other peoples needs.
 
-## `bin_link.sh`
+## `link`
 
 The script is designed to automate the process of hard linking script files from the cloned directory to `$HOME/bin`.
 

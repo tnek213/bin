@@ -42,12 +42,17 @@ for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
     DST_PATH="$DST_DIR/$NOSUFFIX_NAME"
 
     if [ -e "$DST_PATH" ]; then
-      SRC_ID=$(stat -c '%d:%i' "$SRC_PATH")
-      DST_ID=$(stat -c '%d:%i' "$DST_PATH")
-      if [ "$SRC_ID" != "$DST_ID" ]; then
-        echo "Warning: Skipping link as both source '$SRC_PATH' and destination '$DST_PATH' exists but are different files!" 1>&2
+      if [ "$(stat -c '%d:%i' "$SRC_PATH")" = "$(stat -c '%d:%i' "$DST_PATH")" ]; then
+        continue
+      elif
+        diff -q "$SRC_PATH" "$DST_PATH" >/dev/null 2>&1
+      then
+        echo "Note: Replacing '$DST_PATH' with a link (same content)" 1>&2
+        rm -fv "$DST_PATH"
+      else
+        echo "Warning: Skipping link as '$SRC_PATH' differs from '$DST_PATH'" 1>&2
+        continue
       fi
-      continue
     fi
 
     if [ -z "$MSG_SHOWN" ]; then
