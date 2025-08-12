@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 chezmoi-sync() {
   chezmoi git add .
@@ -10,4 +10,3 @@ chezmoi-sync() {
 }
 
 chezmoi-sync
-

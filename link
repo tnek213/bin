@@ -12,7 +12,7 @@ in_path() { command -v "$1" 1>/dev/null; }
 DST_DIR="$HOME/bin"
 mkdir -p "$DST_DIR"
 
-for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
+for PAIR in "bash,#!/usr/bin/env bash" "sh,#!/usr/bin/env sh" "py,#!/usr/bin/env python3"; do
   SUFFIX=${PAIR%,*}
   SHEBANG_LINE=${PAIR#*,}
   SHEBANG_PATH=${PAIR#*\#\!}
