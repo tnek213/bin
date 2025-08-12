@@ -18,7 +18,7 @@ for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
   SHEBANG_PATH=${PAIR#*\#\!}
   SHEBANG_PATH=${SHEBANG_PATH% *}
   if ! in_path "$SHEBANG_PATH"; then
-    echo "Warning: Skipping ALL '*.$SUFFIX' files as '$SHEBANG_PATH' isn't in \$PATH" 1>&2
+    echo "Warning: Skipping ALL '*.$SUFFIX' files as '$SHEBANG_PATH' isn't in \$PATH" >&2
     continue
   fi
 
@@ -30,12 +30,12 @@ for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
     SCRIPT="$(dirname "$SRC_PATH")/.$(basename "$SRC_PATH")"
 
     if ! [ -x "$SRC_PATH" ]; then
-      echo "Warning: Skipping non executable '$SRC_PATH'" 1>&2
+      echo "Warning: Skipping non executable '$SRC_PATH'" >&2
       continue
     fi
 
     if [ "$(head -n 1 "$SRC_PATH")" != "$SHEBANG_LINE" ]; then
-      echo "Warning: Skipping '$SRC_PATH' as it has a malformed or missing shebang" 1>&2
+      echo "Warning: Skipping '$SRC_PATH' as it has a malformed or missing shebang" >&2
       continue
     fi
 
@@ -47,16 +47,16 @@ for PAIR in "bash,#!/bin/bash" "sh,#!/bin/sh" "py,#!/usr/bin/env python3"; do
       elif
         diff -q "$SRC_PATH" "$DST_PATH" >/dev/null 2>&1
       then
-        echo "Note: Replacing '$DST_PATH' with a link (same content)" 1>&2
+        echo "Note: Replacing '$DST_PATH' with a link (same content)" >&2
         rm -fv "$DST_PATH"
       else
-        echo "Warning: Skipping link as '$SRC_PATH' differs from '$DST_PATH'" 1>&2
+        echo "Warning: Skipping link as '$SRC_PATH' differs from '$DST_PATH'" >&2
         continue
       fi
     fi
 
     if [ -z "$MSG_SHOWN" ]; then
-      echo "Linking files from $CLONE_DIR to $DST_DIR..." 1>&2
+      echo "Linking files from $CLONE_DIR to $DST_DIR..." >&2
       MSG_SHOWN='true'
     fi
 
